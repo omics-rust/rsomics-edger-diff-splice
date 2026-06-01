@@ -1,0 +1,33 @@
+[package]
+name = "rsomics-edger-diff-splice"
+version = "0.1.0"
+description = "edgeR diffSpliceDGE + topSpliceDGE — differential exon usage from a negative-binomial GLM fit (per-exon logFC/LR/p-value, gene-level Simes and LR tests)"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/omics-rust/rsomics-edger-diff-splice"
+authors = ["Zane Leong <efd@live.com>"]
+
+[[bin]]
+name = "rsomics-edger-diff-splice"
+path = "src/main.rs"
+
+[lib]
+name = "rsomics_edger_diff_splice"
+path = "src/lib.rs"
+doctest = false
+
+[dependencies]
+rsomics-common = { version = "0.6" }
+rsomics-help = { version = "0.3" }
+clap = { version = "4", features = ["derive"] }
+libm = "0.2"
+rayon = "1"
+
+[dev-dependencies]
+criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }
+tempfile = "3"
+
+[[bench]]
+name = "bench"
+harness = false
