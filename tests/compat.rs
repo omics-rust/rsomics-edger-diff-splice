@@ -1,14 +1,15 @@
 //! Differential compat against edgeR's diffSpliceDGE() + topSpliceDGE().
 //!
 //! `golden_matches_committed` always runs: our binary against the committed
-//! R-captured goldens (exon / Simes / gene). `live_matches_edger` runs the real R
-//! upstream when an r-bioc Rscript is found (RSOMICS_RSCRIPT or
-//! ~/miniconda3/envs/r-bioc/bin/Rscript), else loud-skips.
+//! R-captured goldens (exon / Simes / gene) on two fixtures — a well-conditioned
+//! large-count set and a small-count set (with zeros) that exercises edgeR's
+//! prior.count=0.125 shrinkage, the nexons-1 gene d.f., and the floored Simes.
+//! `live_matches_edger` runs the real R upstream when an r-bioc/rs-edger Rscript
+//! is found (RSOMICS_RSCRIPT overrides), else loud-skips.
 //!
-//! Small (significant) p-values match edgeR to ~1e-6. Everything else carries the
-//! slack of edgeR's own tol=1e-6 Levenberg fit (ours converges tighter): logFC to
-//! ~1e-3, the LR statistics to ~1e-2, and mid-range p-values/FDR to ~1.5e-3. The
-//! inference is identical — the same exons and genes are called significant.
+//! Every value matches edgeR to rel < 1e-6: coefficients come from the
+//! prior-augmented fit, the likelihood ratios from the raw-count deviance, exactly
+//! as diffSpliceDGE constructs them.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -53,13 +54,13 @@ fn compare(expected: &str, got: &str, tol: &[(usize, f64, f64)]) {
     }
 }
 
-fn run(mode: &str, golden: &Path) -> String {
+fn run(prefix: &str, mode: &str, golden: &Path) -> String {
     let out = Command::new(bin())
-        .arg(golden.join("counts.tsv"))
+        .arg(golden.join(format!("{prefix}counts.tsv")))
         .arg("--design")
-        .arg(golden.join("design.tsv"))
+        .arg(golden.join(format!("{prefix}design.tsv")))
         .arg("--genes")
-        .arg(golden.join("genes.tsv"))
+        .arg(golden.join(format!("{prefix}genes.tsv")))
         .args(["--coef", "2", "--test", mode, "--fdr"])
         .output()
         .unwrap();
@@ -71,35 +72,79 @@ fn run(mode: &str, golden: &Path) -> String {
     String::from_utf8(out.stdout).unwrap()
 }
 
+/// NExons is an exact integer; every other column matches edgeR to rel < 1e-6,
+/// with a small absolute floor for the near-zero (no-splicing) rows whose
+/// likelihood ratio is a difference of two near-equal deviances.
+const EXON_TOL: &[(usize, f64, f64)] = &[
+    (0, 2e-6, 1e-6),
+    (1, 2e-6, 1e-6),
+    (2, 2e-6, 1e-6),
+    (3, 2e-6, 1e-6),
+];
+const GENE_TOL: &[(usize, f64, f64)] = &[
+    (0, 0.0, 0.0),
+    (1, 2e-6, 1e-6),
+    (2, 2e-6, 1e-6),
+    (3, 2e-6, 1e-6),
+];
+const SIMES_TOL: &[(usize, f64, f64)] = &[(0, 0.0, 0.0), (1, 2e-6, 1e-6), (2, 2e-6, 1e-6)];
+
+fn check_fixture(prefix: &str, golden: &Path) {
+    compare(
+        &run(prefix, "exon", golden),
+        &std::fs::read_to_string(golden.join(format!("{prefix}expected_exon.tsv"))).unwrap(),
+        EXON_TOL,
+    );
+    compare(
+        &run(prefix, "Simes", golden),
+        &std::fs::read_to_string(golden.join(format!("{prefix}expected_simes.tsv"))).unwrap(),
+        SIMES_TOL,
+    );
+    compare(
+        &run(prefix, "gene", golden),
+        &std::fs::read_to_string(golden.join(format!("{prefix}expected_gene.tsv"))).unwrap(),
+        GENE_TOL,
+    );
+}
+
 #[test]
 fn golden_matches_committed() {
     let golden = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden");
-    compare(
-        &run("exon", &golden),
-        &std::fs::read_to_string(golden.join("expected_exon.tsv")).unwrap(),
-        &[
-            (0, 1e-3, 1e-2),
-            (1, 1e-2, 3e-3),
-            (2, 1.5e-3, 5e-3),
-            (3, 1.5e-3, 5e-3),
-        ],
-    );
-    // NExons is an exact integer; the rest carries the Levenberg slack.
-    compare(
-        &run("Simes", &golden),
-        &std::fs::read_to_string(golden.join("expected_simes.tsv")).unwrap(),
-        &[(0, 0.0, 0.0), (1, 1.5e-3, 5e-3), (2, 1.5e-3, 5e-3)],
-    );
-    compare(
-        &run("gene", &golden),
-        &std::fs::read_to_string(golden.join("expected_gene.tsv")).unwrap(),
-        &[
-            (0, 0.0, 0.0),
-            (1, 1e-2, 3e-3),
-            (2, 1.5e-3, 5e-3),
-            (3, 1.5e-3, 5e-3),
-        ],
-    );
+    check_fixture("", &golden);
+    check_fixture("small_", &golden);
+}
+
+/// edgeR errors on negative or non-finite counts ("Negative counts not allowed");
+/// so does the parser, before any fitting. A garbage row must exit non-zero, never
+/// silently produce a NaN VCF-equivalent.
+#[test]
+fn rejects_bad_counts() {
+    let golden = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden");
+    let dir = tempfile::tempdir().unwrap();
+    for (name, bad_row) in [
+        ("neg", "G1.2\t-5\t3\t2\t4\t1\t2"),
+        ("inf", "G1.2\tinf\t3\t2\t4\t1\t2"),
+        ("nan", "G1.2\tnan\t3\t2\t4\t1\t2"),
+    ] {
+        let counts = dir.path().join(format!("{name}.tsv"));
+        std::fs::write(
+            &counts,
+            format!("exon\tS1\tS2\tS3\tS4\tS5\tS6\nG1.1\t1\t2\t3\t4\t5\t6\n{bad_row}\nG1.3\t2\t2\t2\t2\t2\t2\n"),
+        )
+        .unwrap();
+        let out = Command::new(bin())
+            .arg(&counts)
+            .arg("--design")
+            .arg(golden.join("small_design.tsv"))
+            .arg("--genes")
+            .arg(golden.join("small_genes.tsv"))
+            .output()
+            .unwrap();
+        assert!(
+            !out.status.success(),
+            "{name}: expected non-zero exit on a bad count"
+        );
+    }
 }
 
 fn find_rscript() -> Option<PathBuf> {
@@ -110,14 +155,22 @@ fn find_rscript() -> Option<PathBuf> {
         }
     }
     let home = std::env::var("HOME").ok()?;
-    let cand = PathBuf::from(home).join("miniconda3/envs/r-bioc/bin/Rscript");
-    cand.exists().then_some(cand)
+    for cand in [
+        "miniconda3/envs/r-bioc/bin/Rscript",
+        "miniforge3/envs/rs-edger/bin/Rscript",
+    ] {
+        let p = PathBuf::from(&home).join(cand);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
 }
 
 #[test]
 fn live_matches_edger() {
     let Some(rscript) = find_rscript() else {
-        eprintln!("SKIP live_matches_edger: no r-bioc Rscript (set RSOMICS_RSCRIPT)");
+        eprintln!("SKIP live_matches_edger: no r-bioc/rs-edger Rscript (set RSOMICS_RSCRIPT)");
         return;
     };
     let has_edger = Command::new(&rscript)
@@ -131,73 +184,70 @@ fn live_matches_edger() {
     }
 
     let golden = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden");
-    let counts = golden.join("counts.tsv");
-    let design = golden.join("design.tsv");
-    let genes = golden.join("genes.tsv");
-    let scratch = std::env::temp_dir().join("rsomics-edger-diff-splice-compat");
-    std::fs::create_dir_all(&scratch).unwrap();
-    let r_exon = scratch.join("r_exon.tsv");
-    let r_simes = scratch.join("r_simes.tsv");
-    let r_gene = scratch.join("r_gene.tsv");
+    for prefix in ["", "small_"] {
+        let counts = golden.join(format!("{prefix}counts.tsv"));
+        let design = golden.join(format!("{prefix}design.tsv"));
+        let genes = golden.join(format!("{prefix}genes.tsv"));
+        let scratch =
+            std::env::temp_dir().join(format!("rsomics-edger-diff-splice-compat-{prefix}x"));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let r_exon = scratch.join("r_exon.tsv");
+        let r_simes = scratch.join("r_simes.tsv");
+        let r_gene = scratch.join("r_gene.tsv");
 
-    let script = format!(
-        r#"
+        // gene.df.test holds nexons-1; topSpliceDGE reports the actual exon count,
+        // so NExons = gene.df.test + 1.
+        let script = format!(
+            r#"
 suppressMessages(library(edgeR))
+options(digits=17)
 counts <- as.matrix(read.delim("{c}", row.names=1))
-design <- as.matrix(read.delim("{d}"))
-geneid <- read.delim("{g}")[[1]]
+design <- as.matrix(read.delim("{d}", check.names=FALSE))
+geneid <- as.character(read.delim("{g}")[[1]])
 exonid <- ave(geneid, geneid, FUN=seq_along)
 fit <- glmFit(DGEList(counts=counts), design, dispersion=0.05)
-ds <- diffSpliceDGE(fit, geneid=geneid, exonid=exonid, coef=2)
+ds <- diffSpliceDGE(fit, geneid=geneid, exonid=exonid, coef=2, verbose=FALSE)
 ek <- paste0(ds$genes$GeneID, ".", ds$genes$ExonID)
 ex <- data.frame(ExonID=ek, GeneID=ds$genes$GeneID, logFC=ds$coefficients,
   exon.LR=ds$exon.LR, P.Value=ds$exon.p.value, FDR=p.adjust(ds$exon.p.value,"BH"))
 write.table(ex, "{oe}", sep="\t", quote=FALSE, row.names=FALSE)
 gg <- rownames(ds$gene.df.test)
-si <- data.frame(GeneID=gg, NExons=as.integer(ds$gene.df.test[,1]),
+nex <- as.integer(ds$gene.df.test[,1]) + 1L
+si <- data.frame(GeneID=gg, NExons=nex,
   P.Value=ds$gene.Simes.p.value, FDR=p.adjust(ds$gene.Simes.p.value,"BH"))
 write.table(si, "{os}", sep="\t", quote=FALSE, row.names=FALSE)
-ge <- data.frame(GeneID=gg, NExons=as.integer(ds$gene.df.test[,1]),
+ge <- data.frame(GeneID=gg, NExons=nex,
   gene.LR=as.numeric(ds$gene.LR), P.Value=as.numeric(ds$gene.p.value),
   FDR=p.adjust(as.numeric(ds$gene.p.value),"BH"))
 write.table(ge, "{og}", sep="\t", quote=FALSE, row.names=FALSE)
 "#,
-        c = counts.display(),
-        d = design.display(),
-        g = genes.display(),
-        oe = r_exon.display(),
-        os = r_simes.display(),
-        og = r_gene.display(),
-    );
-    let st = Command::new(&rscript)
-        .args(["-e", &script])
-        .status()
-        .unwrap();
-    assert!(st.success(), "R edgeR run failed");
+            c = counts.display(),
+            d = design.display(),
+            g = genes.display(),
+            oe = r_exon.display(),
+            os = r_simes.display(),
+            og = r_gene.display(),
+        );
+        let st = Command::new(&rscript)
+            .args(["-e", &script])
+            .status()
+            .unwrap();
+        assert!(st.success(), "R edgeR run failed");
 
-    compare(
-        &run("exon", &golden),
-        &std::fs::read_to_string(&r_exon).unwrap(),
-        &[
-            (0, 1e-3, 1e-2),
-            (1, 1e-2, 3e-3),
-            (2, 1.5e-3, 5e-3),
-            (3, 1.5e-3, 5e-3),
-        ],
-    );
-    compare(
-        &run("Simes", &golden),
-        &std::fs::read_to_string(&r_simes).unwrap(),
-        &[(0, 0.0, 0.0), (1, 1.5e-3, 5e-3), (2, 1.5e-3, 5e-3)],
-    );
-    compare(
-        &run("gene", &golden),
-        &std::fs::read_to_string(&r_gene).unwrap(),
-        &[
-            (0, 0.0, 0.0),
-            (1, 1e-2, 3e-3),
-            (2, 1.5e-3, 5e-3),
-            (3, 1.5e-3, 5e-3),
-        ],
-    );
+        compare(
+            &run(prefix, "exon", &golden),
+            &std::fs::read_to_string(&r_exon).unwrap(),
+            EXON_TOL,
+        );
+        compare(
+            &run(prefix, "Simes", &golden),
+            &std::fs::read_to_string(&r_simes).unwrap(),
+            SIMES_TOL,
+        );
+        compare(
+            &run(prefix, "gene", &golden),
+            &std::fs::read_to_string(&r_gene).unwrap(),
+            GENE_TOL,
+        );
+    }
 }

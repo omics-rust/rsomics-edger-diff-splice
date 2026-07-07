@@ -18,8 +18,12 @@ that exon's tested coefficient is held at the gene slope.
 | `FDR` | Benjamini-Hochberg across exons (with `--fdr`) |
 
 `--test gene` reports a gene-level LR test (`gene.LR` = sum of exon LRs, d.f. =
-number of exons). `--test Simes` reports the Simes-combined exon p-value per gene.
-Single-exon genes are not tested.
+number of exons − 1). `--test Simes` reports edgeR's Simes-combined exon p-value
+per gene (`min_r p_(r)·max((nExons−1)/r, 1)`). Single-exon genes are not tested.
+The reported `NExons` column is the exon count itself; the p-value uses the
+`nExons − 1` d.f. Coefficients and fits carry edgeR's `prior.count` (default
+`0.125`, `--prior-count`): a library-size-scaled prior added to every fit so the
+reported log-fold-changes match edgeR, while the likelihood ratios stay unshrunk.
 
 ## Usage
 
@@ -37,6 +41,8 @@ rsomics-edger-diff-splice counts.tsv --design design.tsv --genes genes.tsv \
   takes a per-coefficient weight vector instead.
 - `--dispersion` / `--dispersion-file` — common or per-exon NB dispersion (the
   exon dispersions from `estimateDisp`).
+- `--prior-count` — library-size-scaled prior added to every fit (default
+  `0.125`, edgeR's `diffSpliceDGE` default). Set `0` for unshrunk coefficients.
 
 ```
 rsomics-edger-diff-splice counts.tsv --design design.tsv --genes genes.tsv --coef 2 --test Simes --fdr -o gene.tsv

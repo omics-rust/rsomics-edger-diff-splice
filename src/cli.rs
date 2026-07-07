@@ -37,6 +37,8 @@ pub struct Cli {
     dispersion_file: Option<PathBuf>,
     #[arg(long, value_name = "PATH")]
     norm_factors: Option<PathBuf>,
+    #[arg(long, default_value_t = 0.125)]
+    prior_count: f64,
     #[arg(long, value_enum, default_value_t = TestKind::Exon)]
     test: TestKind,
     #[arg(long)]
@@ -77,6 +79,7 @@ impl Tool for Cli {
                 dispersion: self.dispersion,
                 dispersion_file: self.dispersion_file.as_deref(),
                 norm_factors: self.norm_factors.as_deref(),
+                prior_count: self.prior_count,
                 test,
                 fdr: self.fdr,
             },
@@ -187,6 +190,17 @@ pub static HELP: HelpSpec = HelpSpec {
                 default: None,
                 description: "Per-sample normalization factors; multiplied into library sizes.",
                 why_default: None,
+            },
+            FlagSpec {
+                short: None,
+                long: "prior-count",
+                aliases: &[],
+                value: Some("<float>"),
+                type_hint: Some("f64"),
+                required: false,
+                default: Some("0.125"),
+                description: "Prior count added (library-size scaled) to every exon/gene fit.",
+                why_default: Some("edgeR's diffSpliceDGE default; stabilises small-count fits."),
             },
             FlagSpec {
                 short: None,

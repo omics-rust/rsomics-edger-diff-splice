@@ -4,8 +4,8 @@
 //! Method: McCarthy, Chen & Smyth (2012) NAR 40:4288-4297 (NB GLM), with the
 //! diffSpliceDGE construction reconstructed clean-room from the documented method
 //! and black-box behaviour. Per-exon LR = drop in NB deviance when the tested
-//! coefficient is held at the gene slope; gene LR = sum over exons (df = nExons);
-//! Simes combines exon p-values per gene.
+//! coefficient is held at the gene slope; gene LR = sum over exons (df = nExons − 1);
+//! Simes combines exon p-values per gene. Counts carry edgeR's prior.count=0.125.
 
 mod special;
 
@@ -18,6 +18,11 @@ use rsomics_common::{Result, RsomicsError};
 
 const MAXIT: usize = 200;
 const TOL: f64 = 1e-11;
+
+/// edgeR's `diffSpliceDGE` fits the gene-level betabar with `glmFit`'s default
+/// dispersion (0.05), never the exon dispersions passed in — replicated here so
+/// the reported log-fold-changes are value-exact even when exon dispersions differ.
+const GENE_FIT_DISPERSION: f64 = 0.05;
 
 pub struct Matrix {
     pub header: String,
@@ -55,9 +60,20 @@ impl Matrix {
             exons.push(exon.to_string());
             let before = counts.len();
             for f in fields {
-                counts.push(f.parse::<f64>().map_err(|_| {
+                let c = f.parse::<f64>().map_err(|_| {
                     RsomicsError::InvalidInput(format!("non-numeric count '{f}' for exon {exon}"))
-                })?);
+                })?;
+                if !c.is_finite() {
+                    return Err(RsomicsError::InvalidInput(format!(
+                        "non-finite count '{f}' for exon {exon}"
+                    )));
+                }
+                if c < 0.0 {
+                    return Err(RsomicsError::InvalidInput(format!(
+                        "negative count {c} for exon {exon}"
+                    )));
+                }
+                counts.push(c);
             }
             if counts.len() - before != n_samples {
                 return Err(RsomicsError::InvalidInput(format!(
@@ -203,6 +219,15 @@ fn nb_deviance(y: &[f64], mu: &[f64], dispersion: f64) -> f64 {
 struct Fit {
     beta: Vec<f64>,
     deviance: f64,
+}
+
+/// Per-exon precompute: the prior-shrunk tested coefficient (for the reported
+/// logFC) alongside the raw-count fit (its beta seeds the null refit, its deviance
+/// is the unshrunk full deviance for the LR).
+struct ExonFit {
+    beta_aug_tested: f64,
+    beta_raw: Vec<f64>,
+    dev_raw: f64,
 }
 
 /// IRLS NB GLM, log link, per-sample offset, Levenberg ridge — edgeR mglmLevenberg.
@@ -400,14 +425,19 @@ fn bh_fdr(pvals: &[f64]) -> Vec<f64> {
     adj
 }
 
-/// Simes combination of a gene's exon p-values: min over sorted p of k·p_(i)/i.
+/// edgeR's Simes combination of a gene's exon p-values: the minimum over sorted
+/// p of p_(r)·max((n-1)/r, 1). Differs from textbook Simes (n·p_(r)/r) — edgeR
+/// uses n-1 and floors the multiplier at 1 so the largest p-value enters as-is.
 fn simes(pvals: &[f64]) -> f64 {
     let mut p: Vec<f64> = pvals.to_vec();
     p.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let k = p.len() as f64;
+    let n = p.len() as f64;
     p.iter()
         .enumerate()
-        .map(|(i, &pi)| k * pi / (i as f64 + 1.0))
+        .map(|(i, &pi)| {
+            let r = i as f64 + 1.0;
+            pi * ((n - 1.0) / r).max(1.0)
+        })
         .fold(f64::INFINITY, f64::min)
         .min(1.0)
 }
@@ -428,6 +458,7 @@ pub struct DiffSpliceArgs<'a> {
     pub dispersion: f64,
     pub dispersion_file: Option<&'a Path>,
     pub norm_factors: Option<&'a Path>,
+    pub prior_count: f64,
     pub test: GeneTest,
     pub fdr: bool,
 }
@@ -510,6 +541,21 @@ pub fn diff_splice(args: &DiffSpliceArgs, output: &mut dyn Write) -> Result<u64>
 
     let n = m.n_samples;
 
+    // edgeR addPriorCount: a per-sample prior proportional to library size is added
+    // to every fitted response and the offset grown to match. prior_count defaults
+    // to edgeR's 0.125; without it small-count exon/gene fits diverge from edgeR.
+    let libsize: Vec<f64> = offset.iter().map(|&o| o.exp()).collect();
+    let mean_ls = libsize.iter().sum::<f64>() / n as f64;
+    let prior_scaled: Vec<f64> = libsize
+        .iter()
+        .map(|&l| args.prior_count * l / mean_ls)
+        .collect();
+    let offset_adj: Vec<f64> = libsize
+        .iter()
+        .zip(&prior_scaled)
+        .map(|(&l, &pc)| (l + 2.0 * pc).ln())
+        .collect();
+
     // Group exons by gene in first-seen order; single-exon genes are not tested.
     let mut gene_order: Vec<String> = Vec::new();
     let mut gene_exons: HashMap<String, Vec<usize>> = HashMap::new();
@@ -524,27 +570,42 @@ pub fn diff_splice(args: &DiffSpliceArgs, output: &mut dyn Write) -> Result<u64>
     }
 
     let dir = start_direction(&xdata, n, p);
-    let per_exon = |e: usize| -> Fit {
-        let y = m.row(e);
-        let b0 = one_group_start(y, &offset);
-        let start: Vec<f64> = dir.iter().map(|&d| b0 * d).collect();
-        fit_nb_glm(y, &xdata, &offset, dispersions[e], &start, None)
+    // edgeR reports a prior-shrunk log-fold-change but an unshrunk (raw) likelihood
+    // ratio: coefficients come from the prior.count-augmented fit, the LR from the
+    // raw-count deviance. Each exon therefore needs both fits.
+    let per_exon = |e: usize| -> ExonFit {
+        let raw = m.row(e);
+        let y_aug: Vec<f64> = raw
+            .iter()
+            .zip(&prior_scaled)
+            .map(|(&c, &pc)| c + pc)
+            .collect();
+        let start_a: Vec<f64> = {
+            let b0 = one_group_start(&y_aug, &offset_adj);
+            dir.iter().map(|&d| b0 * d).collect()
+        };
+        let aug = fit_nb_glm(&y_aug, &xdata, &offset_adj, dispersions[e], &start_a, None);
+
+        let y_raw = raw.to_vec();
+        let start_r: Vec<f64> = {
+            let b0 = one_group_start(&y_raw, &offset);
+            dir.iter().map(|&d| b0 * d).collect()
+        };
+        let raw_fit = fit_nb_glm(&y_raw, &xdata, &offset, dispersions[e], &start_r, None);
+
+        ExonFit {
+            beta_aug_tested: aug.beta[tested_col],
+            beta_raw: raw_fit.beta,
+            dev_raw: raw_fit.deviance,
+        }
     };
 
-    let exon_fits: Vec<Fit> = if rayon::current_num_threads() > 1 {
+    let exon_fits: Vec<ExonFit> = if rayon::current_num_threads() > 1 {
         use rayon::prelude::*;
         (0..m.n_exons()).into_par_iter().map(per_exon).collect()
     } else {
         (0..m.n_exons()).map(per_exon).collect()
     };
-    let mut exon_full_beta = vec![0.0f64; m.n_exons() * p];
-    let mut exon_full_dev = vec![0.0f64; m.n_exons()];
-    let mut exon_start: Vec<Vec<f64>> = Vec::with_capacity(m.n_exons());
-    for (e, f) in exon_fits.into_iter().enumerate() {
-        exon_full_beta[e * p..e * p + p].copy_from_slice(&f.beta);
-        exon_full_dev[e] = f.deviance;
-        exon_start.push(f.beta);
-    }
 
     let mut results: HashMap<usize, ExonResult> = HashMap::new();
     let mut gene_lr: HashMap<String, (f64, usize)> = HashMap::new();
@@ -563,10 +624,21 @@ pub fn diff_splice(args: &DiffSpliceArgs, output: &mut dyn Write) -> Result<u64>
                 *s += c;
             }
         }
-        let disp_gene = dispersions[exons[0]];
-        let b0 = one_group_start(&total, &offset);
+        let total_adj: Vec<f64> = total
+            .iter()
+            .zip(&prior_scaled)
+            .map(|(&t, &pc)| t + pc)
+            .collect();
+        let b0 = one_group_start(&total_adj, &offset_adj);
         let start: Vec<f64> = dir.iter().map(|&d| b0 * d).collect();
-        let gene_fit = fit_nb_glm(&total, &xdata, &offset, disp_gene, &start, None);
+        let gene_fit = fit_nb_glm(
+            &total_adj,
+            &xdata,
+            &offset_adj,
+            GENE_FIT_DISPERSION,
+            &start,
+            None,
+        );
         let beta_gene = gene_fit.beta[tested_col];
 
         let mut g_lr = 0.0;
@@ -574,12 +646,13 @@ pub fn diff_splice(args: &DiffSpliceArgs, output: &mut dyn Write) -> Result<u64>
         for &e in exons {
             let y = m.row(e);
             let disp = dispersions[e];
-            let coef = exon_full_beta[e * p + tested_col] - beta_gene;
-            // Null deviance: refit the exon with the tested coef pinned to beta_gene.
-            let mut start = exon_start[e].clone();
+            let coef = exon_fits[e].beta_aug_tested - beta_gene;
+            // Null deviance: the raw-count exon refit with the tested coef pinned to
+            // the (shrunk) gene slope. The LR is unshrunk, so this fit sees no prior.
+            let mut start = exon_fits[e].beta_raw.clone();
             start[tested_col] = beta_gene;
             let null_fit = fit_nb_glm(y, &xdata, &offset, disp, &start, Some(tested_col));
-            let lr = (null_fit.deviance - exon_full_dev[e]).max(0.0);
+            let lr = (null_fit.deviance - exon_fits[e].dev_raw).max(0.0);
             let pval = special::pchisq_upper(lr, 1.0);
             g_lr += lr;
             exon_pvals.push(pval);
@@ -641,12 +714,12 @@ fn write_output(
                 let r = &results[&e];
                 write!(
                     output,
-                    "{}\t{}\t{:.7}\t{:.6}\t{:.6e}",
+                    "{}\t{}\t{:.7e}\t{:.7e}\t{:.7e}",
                     m.exons[e], genes[e], r.coef, r.lr, r.pval
                 )
                 .map_err(RsomicsError::Io)?;
                 if args.fdr {
-                    write!(output, "\t{:.6e}", fdr_map[&e]).map_err(RsomicsError::Io)?;
+                    write!(output, "\t{:.7e}", fdr_map[&e]).map_err(RsomicsError::Io)?;
                 }
                 writeln!(output).map_err(RsomicsError::Io)?;
             }
@@ -660,8 +733,8 @@ fn write_output(
             let pvals: Vec<f64> = tested
                 .iter()
                 .map(|g| {
-                    let (lr, df) = gene_lr[*g];
-                    special::pchisq_upper(lr, df as f64)
+                    let (lr, nexons) = gene_lr[*g];
+                    special::pchisq_upper(lr, (nexons - 1) as f64)
                 })
                 .collect();
             let fdr = bh_fdr(&pvals);
@@ -671,11 +744,11 @@ fn write_output(
             }
             writeln!(output, "{header}").map_err(RsomicsError::Io)?;
             for (i, g) in tested.iter().enumerate() {
-                let (lr, df) = gene_lr[*g];
-                write!(output, "{}\t{}\t{:.6}\t{:.6e}", g, df, lr, pvals[i])
+                let (lr, nexons) = gene_lr[*g];
+                write!(output, "{}\t{}\t{:.7e}\t{:.7e}", g, nexons, lr, pvals[i])
                     .map_err(RsomicsError::Io)?;
                 if args.fdr {
-                    write!(output, "\t{:.6e}", fdr[i]).map_err(RsomicsError::Io)?;
+                    write!(output, "\t{:.7e}", fdr[i]).map_err(RsomicsError::Io)?;
                 }
                 writeln!(output).map_err(RsomicsError::Io)?;
             }
@@ -694,10 +767,10 @@ fn write_output(
             }
             writeln!(output, "{header}").map_err(RsomicsError::Io)?;
             for (i, g) in tested.iter().enumerate() {
-                let (_, df) = gene_lr[*g];
-                write!(output, "{}\t{}\t{:.6e}", g, df, pvals[i]).map_err(RsomicsError::Io)?;
+                let (_, nexons) = gene_lr[*g];
+                write!(output, "{}\t{}\t{:.7e}", g, nexons, pvals[i]).map_err(RsomicsError::Io)?;
                 if args.fdr {
-                    write!(output, "\t{:.6e}", fdr[i]).map_err(RsomicsError::Io)?;
+                    write!(output, "\t{:.7e}", fdr[i]).map_err(RsomicsError::Io)?;
                 }
                 writeln!(output).map_err(RsomicsError::Io)?;
             }
@@ -754,8 +827,9 @@ mod tests {
 
     #[test]
     fn simes_single_small() {
+        // edgeR variant: sorted [0.001, 0.4, 0.5], n=3; min of 0.001·2, 0.4·1, 0.5·1.
         let p = [0.001, 0.5, 0.4];
-        assert!((simes(&p) - 0.003).abs() < 1e-12);
+        assert!((simes(&p) - 0.002).abs() < 1e-12);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "rsomics-edger-diff-splice"
-version = "0.1.0"
+version = "0.1.1"
 description = "edgeR diffSpliceDGE + topSpliceDGE — differential exon usage from a negative-binomial GLM fit (per-exon logFC/LR/p-value, gene-level Simes and LR tests)"
 edition = "2024"
 rust-version = "1.91"

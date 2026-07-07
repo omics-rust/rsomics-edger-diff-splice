@@ -66,6 +66,7 @@ fn bench_diff_splice(c: &mut Criterion) {
                     dispersion: 0.05,
                     dispersion_file: None,
                     norm_factors: None,
+                    prior_count: 0.125,
                     test: GeneTest::Exon,
                     fdr: true,
                 },
